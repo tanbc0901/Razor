@@ -109,6 +109,11 @@ namespace Microsoft.AspNetCore.Razor.Language.Legacy
                 return HandleInsertion(target, lastChar.Value, change);
             }
 
+            if (IsAcceptableInsertionInBalancedParenthesis(target, change))
+            {
+                return PartialParseResultInternal.Accepted;
+            }
+
             if (IsAcceptableDeletion(target, change))
             {
                 return HandleDeletion(target, lastChar.Value, change);
@@ -216,8 +221,152 @@ namespace Microsoft.AspNetCore.Razor.Language.Legacy
         private static bool IsAcceptableInsertion(Span target, SourceChange change)
         {
             return change.IsInsert &&
-                   (IsAcceptableEndInsertion(target, change) ||
-                   IsAcceptableInnerInsertion(target, change));
+                (IsAcceptableEndInsertion(target, change) ||
+                IsAcceptableInnerInsertion(target, change));
+        }
+
+        // Internal for testing
+        internal static bool IsAcceptableInsertionInBalancedParenthesis(Span target, SourceChange change)
+        {
+            if (change.NewText.IndexOfAny(new[] { '(', ')' }) >= 0)
+            {
+                // Insertions of parenthesis aren't handled by us. If someone else wants to accept it, they can.
+                return false;
+            }
+
+            // Determine parenthesis balance to the left of the insertion point
+            var balanceCount = 0;
+            var foundInsertionPoint = false;
+            for (var i = 0; i < target.Symbols.Count; i++)
+            {
+                var currentToken = target.Symbols[i] as CSharpSymbol;
+
+                if (AtInsertionPoint(change, currentToken))
+                {
+                    if (balanceCount == 0)
+                    {
+                        // Insertion point is outside of parenthesis, i.e. inserting at the pipe: @Foo|Baz()
+                        return false;
+                    }
+
+                    foundInsertionPoint = true;
+                }
+
+                if (!TryUpdateBalanceCount(currentToken, ref balanceCount))
+                {
+                    // Couldn't update the count. This usually occurrs when we run into a ')' outside of any parenthesis.
+                    return false;
+                }
+
+                if (foundInsertionPoint && balanceCount == 0)
+                {
+                    // Once parenthesis become balanced after the insertion point we return true, no need to go further.
+                    // If they get unbalanced down the line the expression was already unbalanced to begin with and this
+                    // change happens prior to any ambiguity.
+                    return true;
+                }
+            }
+
+            // Unbalanced parenthesis
+            return false;
+        }
+
+        // Internal for testing
+        internal static bool AtInsertionPoint(SourceChange change, CSharpSymbol currentToken)
+        {
+            var tokenStart = currentToken.Start.AbsoluteIndex;
+            if (tokenStart == change.Span.AbsoluteIndex)
+            {
+                // Token is exactly at the insertion point.
+                return true;
+            }
+
+            var tokenEnd = tokenStart + currentToken.Content.Length;
+            if (tokenStart < change.Span.AbsoluteIndex &&
+                tokenEnd > change.Span.AbsoluteIndex)
+            {
+                // Insertion point falls in the middle of the current token.
+                return true;
+            }
+
+            return false;
+        }
+
+        // Internal for testing
+        internal static bool TryUpdateBalanceCount(CSharpSymbol token, ref int count)
+        {
+            var updatedCount = count;
+            if (token.Type == CSharpSymbolType.LeftParenthesis)
+            {
+                updatedCount++;
+            }
+            else if (token.Type == CSharpSymbolType.RightParenthesis)
+            {
+                if (updatedCount == 0)
+                {
+                    return false;
+                }
+
+                updatedCount--;
+            }
+            else if (token.Type == CSharpSymbolType.StringLiteral)
+            {
+                var content = token.Content;
+                if (content.Length > 0 && content[content.Length - 1] != '"')
+                {
+                    // Incomplete string literal may have consumed some of our parenthesis and usually occurr during auto-completion of '"' => '""'.
+                    if (!TryUpdateCountFromContent(content, ref updatedCount))
+                    {
+                        return false;
+                    }
+                }
+            }
+            else if (token.Type == CSharpSymbolType.CharacterLiteral)
+            {
+                var content = token.Content;
+                if (content.Length > 0 && content[content.Length - 1] != '\'')
+                {
+                    // Incomplete character literal may have consumed some of our parenthesis and usually occurr during auto-completion of "'" => "''".
+                    if (!TryUpdateCountFromContent(content, ref updatedCount))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            if (updatedCount < 0)
+            {
+                return false;
+            }
+
+            count = updatedCount;
+            return true;
+        }
+
+        // Internal for testing
+        internal static bool TryUpdateCountFromContent(string content, ref int count)
+        {
+            var updatedCount = count;
+            for (var i = 0; i < content.Length; i++)
+            {
+                if (content[i] == '(')
+                {
+                    updatedCount++;
+                }
+                else if (content[i] == ')')
+                {
+                    if (updatedCount == 0)
+                    {
+                        // Unbalanced parenthesis, i.e. @Foo)
+                        return false;
+                    }
+
+                    updatedCount--;
+                }
+            }
+
+            count = updatedCount;
+            return true;
         }
 
         // Accepts character insertions at the end of spans.  AKA: '@foo' -> '@fooo' or '@foo' -> '@foo   ' etc.
@@ -291,10 +440,16 @@ namespace Microsoft.AspNetCore.Razor.Language.Legacy
             {
                 return TryAcceptChange(target, change);
             }
-            else
+            else if (previousChar == '(')
             {
-                return PartialParseResultInternal.Rejected;
+                var changeRelativePosition = change.Span.AbsoluteIndex - target.Start.AbsoluteIndex;
+                if (target.Content[changeRelativePosition] == ')')
+                {
+                    return PartialParseResultInternal.Accepted | PartialParseResultInternal.Provisional;
+                }
             }
+
+            return PartialParseResultInternal.Rejected;
         }
 
         private PartialParseResultInternal HandleInsertion(Span target, char previousChar, SourceChange change)
@@ -308,6 +463,10 @@ namespace Microsoft.AspNetCore.Razor.Language.Legacy
             {
                 return HandleInsertionAfterIdPart(target, change);
             }
+            else if (previousChar == '(')
+            {
+                return HandleInsertionAfterOpenParenthesis(target, change);
+            }
             else
             {
                 return PartialParseResultInternal.Rejected;
@@ -319,6 +478,12 @@ namespace Microsoft.AspNetCore.Razor.Language.Legacy
             // If the insertion is a full identifier part, accept it
             if (ParserHelpers.IsIdentifier(change.NewText, requireIdentifierStart: false))
             {
+                return TryAcceptChange(target, change);
+            }
+            else if (IsDoubleParenthesisInsertion(change) || IsOpenParenthesisInsertion(change))
+            {
+                // Allow inserting parens after an identifier - this is needed to support signature
+                // help intellisense in VS.
                 return TryAcceptChange(target, change);
             }
             else if (EndsWithDot(change.NewText))
@@ -335,6 +500,40 @@ namespace Microsoft.AspNetCore.Razor.Language.Legacy
             {
                 return PartialParseResultInternal.Rejected;
             }
+        }
+
+        private PartialParseResultInternal HandleInsertionAfterOpenParenthesis(Span target, SourceChange change)
+        {
+            if (IsCloseParenthesisInsertion(change))
+            {
+                return TryAcceptChange(target, change);
+            }
+
+            return PartialParseResultInternal.Rejected;
+        }
+
+        private static bool IsDoubleParenthesisInsertion(SourceChange change)
+        {
+            return
+                change.IsInsert &&
+                change.NewText.Length == 2 &&
+                change.NewText == "()";
+        }
+
+        private static bool IsOpenParenthesisInsertion(SourceChange change)
+        {
+            return
+                change.IsInsert &&
+                change.NewText.Length == 1 &&
+                change.NewText == "(";
+        }
+
+        private static bool IsCloseParenthesisInsertion(SourceChange change)
+        {
+            return
+                change.IsInsert &&
+                change.NewText.Length == 1 &&
+                change.NewText == ")";
         }
 
         private static bool EndsWithDot(string content)
