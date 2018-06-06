@@ -4,20 +4,35 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
+using System.Reflection;
+#if NET46
+using System.Runtime.Remoting;
+using System.Runtime.Remoting.Messaging;
+#else
+using System.Threading;
+#endif
 using System.Text;
 using Xunit;
+using Xunit.Sdk;
 
 namespace Microsoft.AspNetCore.Razor.Language.Legacy
 {
+    [IntializeTestFile]
     public abstract class ParserTestBase
     {
+#if !NET46
+        private static readonly AsyncLocal<string> _fileName = new AsyncLocal<string>();
+#endif
+
         internal static Block IgnoreOutput = new IgnoreOutputBlock();
 
         internal ParserTestBase()
         {
             Factory = CreateSpanFactory();
             BlockFactory = CreateBlockFactory();
+            TestProjectRoot = TestProject.GetProjectDirectory(GetType());
         }
 
         /// <summary>
@@ -29,6 +44,60 @@ namespace Microsoft.AspNetCore.Razor.Language.Legacy
         internal SpanFactory Factory { get; private set; }
 
         internal BlockFactory BlockFactory { get; private set; }
+
+#if GENERATE_BASELINES
+        protected bool GenerateBaselines { get; set; } = true;
+#else
+        protected bool GenerateBaselines { get; set; } = false;
+#endif
+
+        protected string TestProjectRoot { get; }
+
+        // Used by the test framework to set the 'base' name for test files.
+        public static string FileName
+        {
+#if NET46
+            get
+            {
+                var handle = (ObjectHandle)CallContext.LogicalGetData("IntegrationTestBase_FileName");
+                return (string)handle.Unwrap();
+            }
+            set
+            {
+                CallContext.LogicalSetData("IntegrationTestBase_FileName", new ObjectHandle(value));
+            }
+#elif NETCOREAPP2_2
+            get { return _fileName.Value; }
+            set { _fileName.Value = value; }
+#endif
+        }
+
+        internal void AssertSyntaxTreeNodeMatchesBaseline(SyntaxTreeNode root)
+        {
+            if (FileName == null)
+            {
+                var message = $"{nameof(AssertSyntaxTreeNodeMatchesBaseline)} should only be called from a parser test ({nameof(FileName)} is null).";
+                throw new InvalidOperationException(message);
+            }
+
+            var baselineFileName = Path.ChangeExtension(FileName, ".syntaxtree.txt");
+
+            if (GenerateBaselines)
+            {
+                var baselineFullPath = Path.Combine(TestProjectRoot, baselineFileName);
+                File.WriteAllText(baselineFullPath, SyntaxTreeNodeSerializer.Serialize(root));
+                return;
+            }
+
+            var stFile = TestFile.Create(baselineFileName, GetType().GetTypeInfo().Assembly);
+            if (!stFile.Exists())
+            {
+                throw new XunitException($"The resource {baselineFileName} was not found.");
+            }
+
+            var baseline = stFile.ReadAllText().Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            SyntaxTreeNodeVerifier.Verify(root, baseline);
+        }
 
         internal RazorSyntaxTree ParseBlock(string document, bool designTime)
         {

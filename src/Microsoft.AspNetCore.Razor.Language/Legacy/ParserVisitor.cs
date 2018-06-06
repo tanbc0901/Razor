@@ -5,6 +5,11 @@ namespace Microsoft.AspNetCore.Razor.Language.Legacy
 {
     internal abstract class ParserVisitor
     {
+        public virtual void Visit(SyntaxTreeNode node)
+        {
+            node.Accept(this);
+        }
+
         protected virtual void VisitDefault(Block block)
         {
             for (var i = 0; i < block.Children.Count; i++)
